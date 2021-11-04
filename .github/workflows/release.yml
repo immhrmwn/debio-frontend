@@ -1,0 +1,196 @@
+name: Release automation
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+concurrency:
+  group: release-automation
+
+jobs:
+  compute-build-info:
+    runs-on: ubuntu-latest
+
+    outputs:
+      latest_tag: ${{ steps.build-info.outputs.latest_tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Compute build info
+        id: build-info
+        shell: bash
+        run: |
+          version=${GITHUB_REF#refs/*/}
+          echo $version
+          echo "::set-output name=latest_tag::$version"
+
+  build-and-publish-docker-image:
+    runs-on: ubuntu-latest
+
+    needs: compute-build-info
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Get Vault Secrets
+        uses: hashicorp/vault-action@v2.4.0
+        with:
+          url: ${{ secrets.VAULTURL }}
+          token: ${{ secrets.VAULTTOKEN }}
+          caCertificate: ${{ secrets.VAULTCA }}
+          secrets: |
+              debio_production/data/frontend_dashboard vue_app_dai_contract_address;
+              debio_production/data/frontend_dashboard vue_app_debio_backend_url;
+              debio_production/data/frontend_dashboard vue_app_dev_debio_backend_url;
+              debio_production/data/frontend_dashboard vue_app_dev_debio_escrow_eth_address;
+              debio_production/data/frontend_dashboard vue_app_dev_debio_substrate_ws;
+              debio_production/data/frontend_dashboard vue_app_dev_debio_use_token_name;
+              debio_production/data/frontend_dashboard vue_app_dev_url_faucet;
+              debio_production/data/frontend_dashboard vue_app_dev_web3_rpc;
+              debio_production/data/frontend_dashboard vue_app_recaptcha_site_key;
+              debio_production/data/frontend_dashboard vue_app_role;
+
+      - name: Create .env & gcp sa
+        shell: bash
+        run: |
+          tee -a .env <<EOF
+          VUE_APP_DAI_CONTRACT_ADDRESS=$VUE_APP_DAI_CONTRACT_ADDRESS
+          VUE_APP_DEBIO_BACKEND_URL=$VUE_APP_DEBIO_BACKEND_URL
+          VUE_APP_DEV_DEBIO_BACKEND_URL=$VUE_APP_DEV_DEBIO_BACKEND_URL
+          VUE_APP_DEV_DEBIO_ESCROW_ETH_ADDRESS=$VUE_APP_DEV_DEBIO_ESCROW_ETH_ADDRESS
+          VUE_APP_DEV_DEBIO_SUBSTRATE_WS=$VUE_APP_DEV_DEBIO_SUBSTRATE_WS
+          VUE_APP_DEV_DEBIO_USE_TOKEN_NAME=$VUE_APP_DEV_DEBIO_USE_TOKEN_NAME
+          VUE_APP_DEV_URL_FAUCET=$VUE_APP_DEV_URL_FAUCET
+          VUE_APP_DEV_WEB3_RPC=$VUE_APP_DEV_WEB3_RPC
+          VUE_APP_RECAPTCHA_SITE_KEY=$VUE_APP_RECAPTCHA_SITE_KEY
+          VUE_APP_ROLE=$VUE_APP_ROLE
+          EOF
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Cache Docker layers
+        uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-main
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          file: .maintain/docker/Dockerfile
+          tags: |
+            ${{ github.repository }}:${{ needs.compute-build-info.outputs.latest_tag }}
+            ${{ github.repository }}:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new
+
+      # Temp fix
+      # https://github.com/docker/build-push-action/issues/252
+      # https://github.com/moby/buildkit/issues/1896
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
+
+  deploy:
+    runs-on: ubuntu-latest
+
+    needs: [compute-build-info, build-and-publish-docker-image]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          project_id: ${{ secrets.PROD_GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.PROD_GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Get secrets
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@main
+        with:
+          secrets: |-
+            VUE_APP_DEBIO_USE_TOKEN_NAME:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_DEBIO_USE_TOKEN_NAME
+            VUE_APP_DEBIO_ESCROW_ETH_ADDRESS:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_DEBIO_ESCROW_ETH_ADDRESS
+            VUE_APP_DAI_CONTRACT_ADDRESS:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_DAI_CONTRACT_ADDRESS
+            VUE_APP_DEBIO_SUBSTRATE_WS:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_DEBIO_SUBSTRATE_WS
+            VUE_APP_URL_FAUCET:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_URL_FAUCET
+            VUE_APP_WEB3_RPC:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_WEB3_RPC
+            VUE_APP_DEBIO_BACKEND_URL:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_DEBIO_BACKEND_URL
+            VUE_APP_RECAPTCHA_SITE_KEY:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_RECAPTCHA_SITE_KEY
+            VUE_APP_ROLE:${{ secrets.PROD_GCP_PROJECT_ID }}/VUE_APP_ROLE
+            # STARTUP_PROB_PATH:${{ secrets.PROD_GCP_PROJECT_ID }}/STARTUP_PROB_PATH
+            # LIVENESS_PROB_PATH:${{ secrets.PROD_GCP_PROJECT_ID }}/LIVENESS_PROB_PATH
+            # READINESS_PROB_PATH:${{ secrets.PROD_GCP_PROJECT_ID }}/READINESS_PROB_PATH
+            SSH_HOST:${{ secrets.PROD_GCP_PROJECT_ID }}/SSH_HOST
+            SSH_USERNAME:${{ secrets.PROD_GCP_PROJECT_ID }}/SSH_USERNAME
+            SSH_KEY:${{ secrets.PROD_GCP_PROJECT_ID }}/SSH_KEY
+            SSH_PORT:${{ secrets.PROD_GCP_PROJECT_ID }}/SSH_PORT
+
+      - name: Deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ steps.secrets.outputs.SSH_HOST }}
+          username: ${{ steps.secrets.outputs.SSH_USERNAME }}
+          key: ${{ steps.secrets.outputs.SSH_KEY }}
+          port: ${{ steps.secrets.outputs.SSH_PORT }}
+          script: |
+            ./connect.sh
+            helm repo add debio https://charts.debio.network
+            helm repo update
+            helm upgrade debio-frontend debio/debio-frontend \
+              --install \
+              --set-string image.tag=${{ needs.compute-build-info.outputs.latest_tag }} \
+              --set-string config.debioUseTokenName=${{ steps.secrets.outputs.VUE_APP_DEBIO_USE_TOKEN_NAME }} \
+              --set-string config.debioEscrowETHAddress=${{ steps.secrets.outputs.VUE_APP_DEBIO_ESCROW_ETH_ADDRESS }} \
+              --set-string config.DAIContractAddress=${{ steps.secrets.outputs.VUE_APP_DAI_CONTRACT_ADDRESS }} \
+              --set-string config.debioWs=${{ steps.secrets.outputs.VUE_APP_DEBIO_SUBSTRATE_WS }} \
+              --set-string config.urlFaucet=${{ steps.secrets.outputs.VUE_APP_URL_FAUCET }} \
+              --set-string config.web3Rpc=${{ steps.secrets.outputs.VUE_APP_WEB3_RPC }} \
+              --set-string config.debioBackendUrl=${{ steps.secrets.outputs.VUE_APP_DEBIO_BACKEND_URL }} \
+              --set-string config.recaptchaSiteKey=${{ steps.secrets.outputs.VUE_APP_RECAPTCHA_SITE_KEY }} \
+              --set-string config.role=${{ steps.secrets.outputs.VUE_APP_ROLE }} \
+              # --set-string config.startupProbe.path=${{ steps.secrets.outputs.STARTUP_PROB_PATH }} \
+              # --set-string config.livenessProbe.path=${{ steps.secrets.outputs.LIVENESS_PROB_PATH }} \
+              # --set-string config.readinessProbe.path=${{ steps.secrets.outputs.READINESS_PROB_PATH }} \
+              --set ingress.enabled=true \
+              --set-string ingress.annotations."kubernetes\.io/ingress\.class"=nginx \
+              --set-string ingress.annotations."cert-manager\.io/cluster-issuer"=letsencrypt \
+              --set-string ingress.annotations."nginx\.ingress\.kubernetes\.io/limit-rps"="10" \
+              --set-string ingress.hosts[0].host=old-app.debio.network \
+              --set-string ingress.hosts[0].paths[0].path=/ \
+              --set-string ingress.hosts[0].paths[0].pathType=ImplementationSpecific \
+              --set-string ingress.tls[0].secretName=debio-frontend-tls \
+              --set-string ingress.tls[0].hosts[0]=old-app.debio.network \
+              --set autoscaling.enabled=true
+            kubectl rollout status deployment/debio-frontend
